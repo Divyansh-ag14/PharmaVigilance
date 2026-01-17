@@ -1,0 +1,37 @@
+# ============================================
+# Pharma Vigilance - Requirements
+# AI-Powered Pharmacovigilance System
+# ============================================
+
+# Core Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# AI/LLM Integration
+groq>=0.4.0                 # Groq API for Llama 3 inference
+langchain>=0.1.0            # LLM workflow orchestration
+langchain-groq>=0.1.0       # Groq integration for LangChain
+openai>=1.0.0               # Optional: GPT-4 for production
+
+# Data Validation
+pydantic>=2.0.0             # Structured output validation
+
+# Visualization & Dashboard
+streamlit>=1.30.0           # Interactive dashboard
+plotly>=5.18.0              # Dynamic charts
+altair>=5.0.0               # Declarative visualizations
+
+# Text Processing
+nltk>=3.8.0                 # Natural language toolkit
+regex>=2023.0.0             # Advanced regex support
+
+# Environment & Configuration
+python-dotenv>=1.0.0        # Environment variable management
+
+# Progress & Logging
+tqdm>=4.66.0                # Progress bars
+loguru>=0.7.0               # Better logging
+
+# Optional: Data Export
+openpyxl>=3.1.0             # Excel export support
+
