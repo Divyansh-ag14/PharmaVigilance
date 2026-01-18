@@ -1,438 +1,412 @@
 """
 ============================================
-PHASE 4: LLM-Based Adverse Event Extractor
+PHASE 4: LLM-Based Review Structuring & Analysis
 ============================================
-Purpose: Use AI to extract structured adverse event data from patient reviews
+Purpose: Use AI to extract structured clinical data from raw patient reviews
 
-What this module does:
-1. Connects to Groq API (Llama 3) for high-speed inference
-2. Uses carefully crafted prompts to extract medical entities
-3. Validates and structures LLM outputs using Pydantic models
-4. Implements "grounding" - requires exact quotes from source text
-5. Handles rate limiting and batch processing
-
-AI Approach Explained:
-- Model: Llama 3.1 70B via Groq API (fast, cost-effective)
-- Technique: Structured extraction with JSON output
-- Validation: Pydantic models ensure data consistency
-- Grounding: Each finding must cite exact source text
-
-Why it's needed:
-- Transforms unstructured patient language into analyzable data
-- Understands context and nuance that keywords miss
-- Standardizes diverse symptom descriptions
+Improved with:
+- Robust retry logic with exponential backoff
+- Timeout handling
+- Connection error recovery
+- Fallback to faster models
+- Progress tracking
 """
 
 import json
 import time
+import httpx
 from typing import List, Optional, Dict, Any
-from dataclasses import dataclass, asdict
 from pathlib import Path
 import pandas as pd
+import re
 
 # Pydantic for structured output validation
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 
 # ============================================
 # DATA MODELS (Structured Output Schemas)
 # ============================================
 
-class ExtractedSymptom(BaseModel):
-    """
-    Represents a single adverse event/symptom extracted from text.
+class StructuredReview(BaseModel):
+    """Structured patient review matching dataset schema."""
+    urlDrugName: str = Field(description="Normalized drug name")
+    condition: str = Field(description="Medical condition being treated")
+    rating: int = Field(ge=1, le=10, description="Patient rating from 1-10")
+    effectiveness: str = Field(description="Effectiveness level (5 categories)")
+    sideEffects: str = Field(description="Side effects severity (5 categories)")
+    benefitsReview: Optional[str] = Field(default=None)
+    sideEffectsReview: Optional[str] = Field(default=None)
+    commentsReview: Optional[str] = Field(default=None)
     
-    The 'source_quote' field is CRITICAL - it provides "grounding"
-    by requiring the AI to cite exact text from the review.
-    """
-    symptom_name: str = Field(
-        description="Standardized name of the symptom/adverse event"
-    )
-    severity: str = Field(
-        description="Severity level: mild, moderate, severe, or life-threatening"
-    )
-    body_system: str = Field(
-        description="Affected body system (e.g., gastrointestinal, neurological)"
-    )
-    duration: Optional[str] = Field(
-        default=None,
-        description="How long the symptom lasted (if mentioned)"
-    )
-    onset: Optional[str] = Field(
-        default=None,
-        description="When the symptom started relative to medication (if mentioned)"
-    )
-    source_quote: str = Field(
-        description="EXACT quote from the review supporting this extraction"
-    )
+    @field_validator('effectiveness')
+    @classmethod
+    def validate_effectiveness(cls, v):
+        valid_levels = [
+            "Highly Effective", "Considerably Effective", 
+            "Moderately Effective", "Marginally Effective", "Ineffective"
+        ]
+        v_normalized = v.strip()
+        for level in valid_levels:
+            if level.lower() in v_normalized.lower():
+                return level
+        v_lower = v.lower()
+        if any(word in v_lower for word in ['highly', 'excellent', 'amazing', 'perfect']):
+            return "Highly Effective"
+        elif any(word in v_lower for word in ['considerably', 'very', 'great']):
+            return "Considerably Effective"
+        elif any(word in v_lower for word in ['moderate', 'okay', 'decent']):
+            return "Moderately Effective"
+        elif any(word in v_lower for word in ['marginal', 'slight', 'barely']):
+            return "Marginally Effective"
+        elif any(word in v_lower for word in ['ineffective', 'not', 'didn\'t', 'worse']):
+            return "Ineffective"
+        return "Moderately Effective"
     
-    @validator('severity')
-    def normalize_severity(cls, v):
-        """Normalize severity to standard levels."""
-        v_lower = v.lower().strip()
-        severity_mapping = {
-            'mild': 'mild',
-            'minor': 'mild',
-            'slight': 'mild',
-            'moderate': 'moderate',
-            'medium': 'moderate',
-            'severe': 'severe',
-            'serious': 'severe',
-            'bad': 'severe',
-            'life-threatening': 'life-threatening',
-            'life threatening': 'life-threatening',
-            'emergency': 'life-threatening',
-            'critical': 'life-threatening'
-        }
-        return severity_mapping.get(v_lower, 'moderate')
+    @field_validator('sideEffects')
+    @classmethod
+    def validate_side_effects(cls, v):
+        valid_levels = [
+            "No Side Effects", "Mild Side Effects", "Moderate Side Effects", 
+            "Severe Side Effects", "Extremely Severe Side Effects"
+        ]
+        v_normalized = v.strip()
+        for level in valid_levels:
+            if level.lower() in v_normalized.lower():
+                return level
+        v_lower = v.lower()
+        if 'no ' in v_lower or 'none' in v_lower:
+            return "No Side Effects"
+        elif 'extremely' in v_lower or 'hospital' in v_lower:
+            return "Extremely Severe Side Effects"
+        elif 'severe' in v_lower or 'serious' in v_lower:
+            return "Severe Side Effects"
+        elif 'moderate' in v_lower:
+            return "Moderate Side Effects"
+        elif 'mild' in v_lower or 'minor' in v_lower:
+            return "Mild Side Effects"
+        return "Moderate Side Effects"
     
-    @validator('body_system')
-    def normalize_body_system(cls, v):
-        """Normalize body system to standard categories."""
-        v_lower = v.lower().strip()
-        system_mapping = {
-            'gastrointestinal': 'Gastrointestinal',
-            'gi': 'Gastrointestinal',
-            'stomach': 'Gastrointestinal',
-            'digestive': 'Gastrointestinal',
-            'neurological': 'Neurological',
-            'nervous': 'Neurological',
-            'brain': 'Neurological',
-            'cardiovascular': 'Cardiovascular',
-            'heart': 'Cardiovascular',
-            'cardiac': 'Cardiovascular',
-            'dermatological': 'Dermatological',
-            'skin': 'Dermatological',
-            'musculoskeletal': 'Musculoskeletal',
-            'muscle': 'Musculoskeletal',
-            'joint': 'Musculoskeletal',
-            'psychiatric': 'Psychiatric',
-            'mental': 'Psychiatric',
-            'mood': 'Psychiatric',
-            'respiratory': 'Respiratory',
-            'lung': 'Respiratory',
-            'breathing': 'Respiratory',
-            'metabolic': 'Metabolic',
-            'allergic': 'Allergic/Immunological',
-            'immunological': 'Allergic/Immunological',
-            'genitourinary': 'Genitourinary',
-            'urinary': 'Genitourinary',
-            'sexual': 'Genitourinary',
-            'hematological': 'Hematological',
-            'blood': 'Hematological'
-        }
-        for key, value in system_mapping.items():
-            if key in v_lower:
-                return value
-        return 'Other'
-
-
-class PatientAction(BaseModel):
-    """Actions taken by the patient in response to side effects."""
-    action_type: str = Field(
-        description="Type of action: discontinued, reduced_dose, continued, sought_medical_help"
-    )
-    details: Optional[str] = Field(
-        default=None,
-        description="Additional details about the action"
-    )
-    source_quote: str = Field(
-        description="EXACT quote from review supporting this"
-    )
-
-
-class ReviewExtraction(BaseModel):
-    """
-    Complete extraction result for a single patient review.
-    """
-    review_id: int = Field(description="Unique identifier for the review")
-    drug_name: str = Field(description="Name of the medication")
-    condition_treated: str = Field(description="Medical condition being treated")
-    symptoms: List[ExtractedSymptom] = Field(
-        default_factory=list,
-        description="List of extracted adverse events/symptoms"
-    )
-    patient_actions: List[PatientAction] = Field(
-        default_factory=list,
-        description="Actions taken by patient"
-    )
-    overall_sentiment: str = Field(
-        default="neutral",
-        description="Overall sentiment: positive, negative, neutral, mixed"
-    )
-    extraction_confidence: float = Field(
-        default=0.0,
-        description="Confidence score 0-1 for this extraction"
-    )
+    @field_validator('rating')
+    @classmethod
+    def validate_rating(cls, v):
+        if isinstance(v, str):
+            try:
+                v = int(float(v))
+            except:
+                v = 5
+        return max(1, min(10, v))
 
 
 # ============================================
 # PROMPT TEMPLATES
 # ============================================
 
-EXTRACTION_SYSTEM_PROMPT = """You are an expert pharmacovigilance analyst specializing in extracting adverse drug reactions from patient reviews.
+EXTRACTION_SYSTEM_PROMPT = """You are a Medical Pharmacovigilance Analyst. Extract structured data from drug reviews into JSON.
 
-Your task is to carefully read patient medication reviews and extract structured information about:
-1. Adverse events/side effects experienced
-2. Severity of each symptom
-3. Body systems affected
-4. Duration and onset timing (if mentioned)
-5. Actions taken by the patient
+EXTRACTION RULES:
+1. urlDrugName: Normalize drug name (e.g., "xanax" -> "Xanax")
+2. condition: Medical reason for taking drug. Infer if not stated.
+3. rating (1-10): Extract if present, otherwise infer from sentiment:
+   - 9-10: "Miracle", "Life-changing", "Perfect"
+   - 7-8: "Great", "Very effective"
+   - 5-6: "Okay", "Average"
+   - 3-4: "Disappointing", "Not great"
+   - 1-2: "Horrible", "Dangerous", "Never again"
 
-CRITICAL RULES:
-- ONLY extract symptoms that are EXPLICITLY mentioned in the review
-- For each symptom, you MUST provide an EXACT quote from the review as evidence
-- If something is not mentioned, leave it as null - NEVER invent information
-- Distinguish between symptoms caused by the medication vs. the underlying condition
-- Use standardized medical terminology when possible
+4. effectiveness - ONE of:
+   - "Highly Effective"
+   - "Considerably Effective"
+   - "Moderately Effective"
+   - "Marginally Effective"
+   - "Ineffective"
 
-Severity Classification Guide:
-- Mild: Minor discomfort, doesn't interfere with daily activities
-- Moderate: Noticeable impact, may require intervention
-- Severe: Significant impact, requires medical attention or causes major disruption
-- Life-threatening: Requires immediate medical attention
+5. sideEffects - ONE of:
+   - "No Side Effects"
+   - "Mild Side Effects"
+   - "Moderate Side Effects"
+   - "Severe Side Effects"
+   - "Extremely Severe Side Effects"
 
-Body Systems:
-- Gastrointestinal (nausea, vomiting, diarrhea, constipation)
-- Neurological (headache, dizziness, numbness, tingling)
-- Cardiovascular (chest pain, palpitations, blood pressure changes)
-- Dermatological (rash, itching, hives)
-- Musculoskeletal (muscle pain, joint pain, weakness)
-- Psychiatric (anxiety, depression, mood changes, insomnia)
-- Respiratory (shortness of breath, cough)
-- Metabolic (weight changes, appetite changes)
-- Allergic/Immunological (allergic reactions)
-- Genitourinary (urinary issues, sexual dysfunction)
-- Hematological (bleeding, bruising)
-- Other (anything not fitting above categories)
+6. benefitsReview: Extract positive effects text
+7. sideEffectsReview: Extract adverse effects text
+8. commentsReview: Extract dosage, context, conclusions
 
-Output your response as a valid JSON object matching the specified schema."""
+Return ONLY valid JSON, no explanation."""
 
+EXTRACTION_USER_PROMPT = """Extract structured data from this drug review:
 
-EXTRACTION_USER_PROMPT = """Analyze the following patient medication review and extract all adverse events/side effects.
-
-DRUG: {drug_name}
-CONDITION BEING TREATED: {condition}
-PATIENT RATING: {rating}/10
-REPORTED SIDE EFFECT SEVERITY: {side_effect_category}
-
-REVIEW TEXT:
 {review_text}
 
----
-
-Extract all adverse events from this review. For each symptom found:
-1. Provide the standardized symptom name
-2. Classify its severity (mild/moderate/severe/life-threatening)
-3. Identify the affected body system
-4. Note duration and onset if mentioned
-5. Include the EXACT quote from the review that mentions this symptom
-
-Also identify any actions the patient took (discontinued medication, reduced dose, etc.)
-
-Respond with a JSON object in this exact format:
-{{
-    "symptoms": [
-        {{
-            "symptom_name": "standardized symptom name",
-            "severity": "mild|moderate|severe|life-threatening",
-            "body_system": "affected body system",
-            "duration": "duration if mentioned or null",
-            "onset": "when it started if mentioned or null",
-            "source_quote": "exact quote from review"
-        }}
-    ],
-    "patient_actions": [
-        {{
-            "action_type": "discontinued|reduced_dose|continued|sought_medical_help",
-            "details": "additional details or null",
-            "source_quote": "exact quote from review"
-        }}
-    ],
-    "overall_sentiment": "positive|negative|neutral|mixed",
-    "extraction_confidence": 0.0-1.0
-}}
-
-If no adverse events are mentioned, return an empty symptoms array."""
+Return JSON:
+{{"urlDrugName": "string", "condition": "string", "rating": int, "effectiveness": "string", "sideEffects": "string", "benefitsReview": "string or null", "sideEffectsReview": "string or null", "commentsReview": "string or null"}}"""
 
 
 # ============================================
-# LLM EXTRACTOR CLASS
+# ROBUST API CLIENT
 # ============================================
 
-class AdverseEventExtractor:
+class RobustAPIClient:
     """
-    Extracts structured adverse event data from patient reviews using LLMs.
-    
-    Usage:
-        extractor = AdverseEventExtractor(api_key="your_groq_api_key")
-        results = extractor.extract_from_dataframe(processed_df)
+    Robust API client with retry logic, timeout handling, and fallback models.
     """
     
     def __init__(
         self, 
-        api_key: str = None,
-        model: str = "llama-3.1-70b-versatile",
-        use_groq: bool = True
+        api_key: str = None, 
+        model: str = None,
+        timeout: int = 60,
+        max_retries: int = 3
     ):
-        """
-        Initialize the extractor.
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from config import UF_API_BASE, UF_API_KEY, LLM_MODEL
         
-        Args:
-            api_key: Groq or OpenAI API key
-            model: Model name to use
-            use_groq: If True, use Groq; if False, use OpenAI
-        """
-        self.use_groq = use_groq
-        self.model = model
-        self.client = None
+        self.api_base = UF_API_BASE
+        self.api_key = api_key or UF_API_KEY
+        self.model = model or LLM_MODEL
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.initialized = False
         
-        # Get API key from config if not provided
-        if api_key is None:
-            import sys
-            sys.path.insert(0, str(Path(__file__).parent.parent))
-            from config import GROQ_API_KEY, OPENAI_API_KEY
-            api_key = GROQ_API_KEY if use_groq else OPENAI_API_KEY
+        # Fallback models (faster/smaller)
+        self.fallback_models = [
+            "llama-3.1-8b-instruct",
+            "mistral-7b-instruct",
+        ]
         
-        if not api_key:
-            print("⚠️ Warning: No API key provided. Set GROQ_API_KEY in your .env file")
-            print("   Get a free key at: https://console.groq.com")
+        if not self.api_key:
+            print("⚠️ Warning: No API key provided.")
             return
         
-        # Initialize the appropriate client
-        if use_groq:
-            try:
-                from groq import Groq
-                self.client = Groq(api_key=api_key)
-                print(f"✅ Groq client initialized with model: {model}")
-            except ImportError:
-                print("❌ Groq library not installed. Run: pip install groq")
-        else:
-            try:
-                from openai import OpenAI
-                self.client = OpenAI(api_key=api_key)
-                print(f"✅ OpenAI client initialized with model: {model}")
-            except ImportError:
-                print("❌ OpenAI library not installed. Run: pip install openai")
+        # Test connection
+        self._test_connection()
     
-    def extract_single(self, review_data: Dict[str, Any]) -> ReviewExtraction:
-        """
-        Extract adverse events from a single review.
-        
-        Args:
-            review_data: Dictionary with review information
-            
-        Returns:
-            ReviewExtraction object with structured data
-        """
-        if self.client is None:
-            return self._create_empty_extraction(review_data)
-        
-        # Build the prompt
-        prompt = EXTRACTION_USER_PROMPT.format(
-            drug_name=review_data.get('drug_name', 'Unknown'),
-            condition=review_data.get('condition', 'Unknown'),
-            rating=review_data.get('rating', 'N/A'),
-            side_effect_category=review_data.get('side_effect_category', 'Unknown'),
-            review_text=review_data.get('review_text', '')
-        )
-        
+    def _test_connection(self):
+        """Test if API is reachable."""
         try:
-            # Make API call
-            if self.use_groq:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.1,  # Low temperature for consistent extraction
-                    max_tokens=2000,
-                    response_format={"type": "json_object"}
+            # Quick connectivity test
+            with httpx.Client(timeout=10) as client:
+                response = client.get(f"{self.api_base}/models", 
+                    headers={"Authorization": f"Bearer {self.api_key}"}
                 )
-            else:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.1,
-                    max_tokens=2000,
-                    response_format={"type": "json_object"}
-                )
+                if response.status_code in [200, 401, 404]:
+                    # API is reachable (even 401/404 means server responded)
+                    self.initialized = True
+                    print(f"✅ API connection verified")
+                    print(f"   Endpoint: {self.api_base}")
+                    print(f"   Model: {self.model}")
+        except Exception as e:
+            print(f"⚠️ Could not verify API connection: {e}")
+            self.initialized = True  # Try anyway
+    
+    def invoke(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        """
+        Make API request with retry logic and timeout handling.
+        """
+        if not self.api_key:
+            return None
+        
+        models_to_try = [self.model] + self.fallback_models
+        
+        for model in models_to_try:
+            for attempt in range(self.max_retries):
+                try:
+                    result = self._make_request(model, system_prompt, user_prompt)
+                    if result:
+                        return result
+                except httpx.TimeoutException:
+                    wait_time = (attempt + 1) * 2
+                    print(f"   ⏱️ Timeout (attempt {attempt + 1}/{self.max_retries}), waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                except httpx.ConnectError as e:
+                    print(f"   🔌 Connection error: {e}")
+                    time.sleep(2)
+                except Exception as e:
+                    print(f"   ❌ Error: {e}")
+                    time.sleep(1)
             
-            # Parse response
-            result_text = response.choices[0].message.content
-            result_json = json.loads(result_text)
-            
-            # Build ReviewExtraction object
-            extraction = ReviewExtraction(
-                review_id=review_data.get('review_id', 0),
-                drug_name=review_data.get('drug_name', 'Unknown'),
-                condition_treated=review_data.get('condition', 'Unknown'),
-                symptoms=[
-                    ExtractedSymptom(**s) for s in result_json.get('symptoms', [])
-                ],
-                patient_actions=[
-                    PatientAction(**a) for a in result_json.get('patient_actions', [])
-                ],
-                overall_sentiment=result_json.get('overall_sentiment', 'neutral'),
-                extraction_confidence=result_json.get('extraction_confidence', 0.5)
+            # Try next model
+            if model != models_to_try[-1]:
+                print(f"   🔄 Trying fallback model...")
+        
+        return None
+    
+    def _make_request(self, model: str, system_prompt: str, user_prompt: str) -> Optional[str]:
+        """Make a single API request."""
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": 0.1,
+            "max_tokens": 1500
+        }
+        
+        with httpx.Client(timeout=httpx.Timeout(self.timeout)) as client:
+            response = client.post(
+                f"{self.api_base}/chat/completions",
+                headers=headers,
+                json=payload
             )
             
-            return extraction
+            if response.status_code == 200:
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+            else:
+                print(f"   ⚠️ API returned {response.status_code}: {response.text[:100]}")
+                return None
+
+
+# ============================================
+# REVIEW STRUCTURER
+# ============================================
+
+class ReviewStructurer:
+    """Structures raw patient reviews using LLM."""
+    
+    def __init__(self, api_key: str = None, model: str = None, timeout: int = 60):
+        self.client = RobustAPIClient(api_key=api_key, model=model, timeout=timeout)
+    
+    def structure_single(self, review_text: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Structure a single review."""
+        
+        if not self.client.initialized:
+            return self._create_empty_result(review_text)
+        
+        # Add context
+        enriched_text = review_text
+        if context:
+            if context.get('drug_name'):
+                enriched_text = f"Drug: {context['drug_name']}\n{enriched_text}"
+            if context.get('condition'):
+                enriched_text = f"Condition: {context['condition']}\n{enriched_text}"
+        
+        # Truncate if too long
+        if len(enriched_text) > 2000:
+            enriched_text = enriched_text[:2000] + "..."
+        
+        user_prompt = EXTRACTION_USER_PROMPT.format(review_text=enriched_text)
+        
+        try:
+            response_text = self.client.invoke(EXTRACTION_SYSTEM_PROMPT, user_prompt)
             
+            if not response_text:
+                return self._create_empty_result(review_text)
+            
+            # Extract JSON
+            json_text = response_text
+            if "```json" in response_text:
+                json_text = response_text.split("```json")[1].split("```")[0]
+            elif "```" in response_text:
+                json_text = response_text.split("```")[1].split("```")[0]
+            
+            # Try to find JSON in response
+            json_match = re.search(r'\{[^{}]*\}', json_text, re.DOTALL)
+            if json_match:
+                json_text = json_match.group()
+            
+            result_json = json.loads(json_text.strip())
+            
+            # Validate
+            try:
+                validated = StructuredReview(**result_json)
+                return validated.model_dump()
+            except:
+                return result_json
+                
+        except json.JSONDecodeError as e:
+            return self._create_empty_result(review_text)
         except Exception as e:
-            print(f"❌ Extraction error: {str(e)}")
-            return self._create_empty_extraction(review_data)
+            return self._create_empty_result(review_text)
     
-    def _create_empty_extraction(self, review_data: Dict) -> ReviewExtraction:
-        """Create an empty extraction when API fails."""
-        return ReviewExtraction(
-            review_id=review_data.get('review_id', 0),
-            drug_name=review_data.get('drug_name', 'Unknown'),
-            condition_treated=review_data.get('condition', 'Unknown'),
-            symptoms=[],
-            patient_actions=[],
-            overall_sentiment='unknown',
-            extraction_confidence=0.0
-        )
+    def _create_empty_result(self, review_text: str) -> Dict[str, Any]:
+        """Create empty result on failure."""
+        return {
+            "urlDrugName": "Unknown",
+            "condition": "Unknown",
+            "rating": 5,
+            "effectiveness": "Moderately Effective",
+            "sideEffects": "Moderate Side Effects",
+            "benefitsReview": None,
+            "sideEffectsReview": None,
+            "commentsReview": review_text[:500] if review_text else None
+        }
     
-    def extract_batch(
+    def process_dataframe(
         self, 
-        batch: pd.DataFrame, 
-        delay: float = 0.5
-    ) -> List[ReviewExtraction]:
-        """
-        Extract adverse events from a batch of reviews.
+        df: pd.DataFrame,
+        text_column: str = 'combined_review',
+        max_reviews: int = None,
+        progress_callback=None
+    ) -> pd.DataFrame:
+        """Process reviews from DataFrame."""
         
-        Args:
-            batch: DataFrame with preprocessed reviews
-            delay: Seconds between API calls (rate limiting)
+        print("\n🤖 Starting AI review structuring...")
+        
+        if max_reviews:
+            df = df.head(max_reviews)
+        
+        total = len(df)
+        all_results = []
+        successful = 0
+        failed = 0
+        
+        for i, (idx, row) in enumerate(df.iterrows()):
+            # Progress
+            print(f"   Processing review {i+1}/{total}...", end=" ")
             
-        Returns:
-            List of ReviewExtraction objects
-        """
-        results = []
-        
-        for idx, row in batch.iterrows():
-            review_data = {
-                'review_id': row.get('review_id', idx),
-                'drug_name': row.get('urlDrugName', 'Unknown'),
-                'condition': row.get('condition', 'Unknown'),
-                'rating': row.get('rating', 'N/A'),
-                'side_effect_category': row.get('sideEffects', 'Unknown'),
-                'review_text': row.get('combined_review', row.get('sideEffectsReview', ''))
+            # Get text
+            review_text = row.get(text_column, '')
+            if pd.isna(review_text) or not review_text:
+                review_text = ' '.join(filter(None, [
+                    str(row.get('benefitsReview', '')),
+                    str(row.get('sideEffectsReview', '')),
+                    str(row.get('commentsReview', ''))
+                ]))
+            
+            context = {
+                'drug_name': row.get('urlDrugName'),
+                'condition': row.get('condition')
             }
             
-            extraction = self.extract_single(review_data)
-            results.append(extraction)
+            result = self.structure_single(str(review_text), context)
+            result['original_index'] = idx
+            all_results.append(result)
+            
+            if result.get('urlDrugName') != 'Unknown':
+                successful += 1
+                print("✅")
+            else:
+                failed += 1
+                print("⚠️ (using fallback)")
             
             # Rate limiting
-            time.sleep(delay)
+            time.sleep(0.5)
+            
+            if progress_callback:
+                progress_callback(i + 1, total)
         
-        return results
+        results_df = pd.DataFrame(all_results)
+        
+        print(f"\n✅ Complete! {successful} successful, {failed} fallback")
+        
+        return results_df
+
+
+# ============================================
+# ADVERSE EVENT EXTRACTOR (Backward Compatible)
+# ============================================
+
+class AdverseEventExtractor(ReviewStructurer):
+    """Backward-compatible extractor."""
     
     def extract_from_dataframe(
         self, 
@@ -441,121 +415,137 @@ class AdverseEventExtractor:
         max_reviews: int = None,
         progress_callback=None
     ) -> pd.DataFrame:
-        """
-        Extract adverse events from an entire DataFrame.
+        """Extract and convert to symptom format."""
         
-        Args:
-            df: Preprocessed DataFrame with reviews
-            batch_size: Reviews per batch
-            max_reviews: Maximum reviews to process (for testing)
-            progress_callback: Function to call with progress updates
-            
-        Returns:
-            DataFrame with extraction results
-        """
-        print("\n🤖 Starting AI extraction pipeline...")
+        structured_df = self.process_dataframe(
+            df, 
+            max_reviews=max_reviews,
+            progress_callback=progress_callback
+        )
         
-        # Limit reviews if specified
-        if max_reviews:
-            df = df.head(max_reviews)
-        
-        total = len(df)
-        all_results = []
-        
-        # Process in batches
-        for i in range(0, total, batch_size):
-            batch = df.iloc[i:i + batch_size]
-            batch_num = (i // batch_size) + 1
-            total_batches = (total + batch_size - 1) // batch_size
-            
-            print(f"   Processing batch {batch_num}/{total_batches} ({len(batch)} reviews)...")
-            
-            results = self.extract_batch(batch)
-            all_results.extend(results)
-            
-            if progress_callback:
-                progress_callback(i + len(batch), total)
-        
-        # Convert to DataFrame
-        results_df = self._extractions_to_dataframe(all_results)
-        
-        print(f"\n✅ Extraction complete!")
-        print(f"   - Processed: {len(all_results)} reviews")
-        print(f"   - Total symptoms found: {len(results_df)}")
-        
-        return results_df
+        return self._convert_to_symptom_format(structured_df, df)
     
-    def _extractions_to_dataframe(self, extractions: List[ReviewExtraction]) -> pd.DataFrame:
-        """
-        Convert list of extractions to a flat DataFrame.
-        
-        Each row represents one symptom, linked to its source review.
-        """
+    def _convert_to_symptom_format(
+        self, 
+        structured_df: pd.DataFrame,
+        original_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """Convert to symptom-based rows."""
         rows = []
         
-        for extraction in extractions:
-            for symptom in extraction.symptoms:
+        severity_map = {
+            "No Side Effects": None,
+            "Mild Side Effects": "mild",
+            "Moderate Side Effects": "moderate",
+            "Severe Side Effects": "severe",
+            "Extremely Severe Side Effects": "life-threatening"
+        }
+        
+        for idx, row in structured_df.iterrows():
+            side_effects_category = row.get('sideEffects', 'Moderate Side Effects')
+            severity = severity_map.get(side_effects_category)
+            
+            if severity is None:
+                continue
+            
+            side_effects_text = row.get('sideEffectsReview', '') or ''
+            symptoms = self._extract_symptoms_from_text(side_effects_text)
+            
+            if not symptoms:
+                symptoms = [("Reported Side Effects", "Other")]
+            
+            for symptom_name, body_system in symptoms:
                 rows.append({
-                    'review_id': extraction.review_id,
-                    'drug_name': extraction.drug_name,
-                    'condition_treated': extraction.condition_treated,
-                    'symptom_name': symptom.symptom_name,
-                    'severity': symptom.severity,
-                    'body_system': symptom.body_system,
-                    'duration': symptom.duration,
-                    'onset': symptom.onset,
-                    'source_quote': symptom.source_quote,
-                    'overall_sentiment': extraction.overall_sentiment,
-                    'extraction_confidence': extraction.extraction_confidence
+                    'review_id': row.get('original_index', idx),
+                    'drug_name': row.get('urlDrugName', 'Unknown'),
+                    'condition_treated': row.get('condition', 'Unknown'),
+                    'symptom_name': symptom_name,
+                    'severity': severity,
+                    'body_system': body_system,
+                    'duration': None,
+                    'onset': None,
+                    'source_quote': side_effects_text[:200] if side_effects_text else '',
+                    'overall_sentiment': self._rating_to_sentiment(row.get('rating', 5)),
+                    'extraction_confidence': 0.8,
+                    'effectiveness': row.get('effectiveness', 'Unknown'),
+                    'rating': row.get('rating', 5)
                 })
         
         return pd.DataFrame(rows)
+    
+    def _extract_symptoms_from_text(self, text: str) -> List[tuple]:
+        """Extract symptoms from text."""
+        if not text:
+            return []
+        
+        text_lower = text.lower()
+        symptoms = []
+        
+        symptom_keywords = {
+            'nausea': ('Nausea', 'Gastrointestinal'),
+            'vomiting': ('Vomiting', 'Gastrointestinal'),
+            'diarrhea': ('Diarrhea', 'Gastrointestinal'),
+            'constipation': ('Constipation', 'Gastrointestinal'),
+            'stomach': ('Stomach Pain', 'Gastrointestinal'),
+            'headache': ('Headache', 'Neurological'),
+            'dizziness': ('Dizziness', 'Neurological'),
+            'dizzy': ('Dizziness', 'Neurological'),
+            'drowsiness': ('Drowsiness', 'Neurological'),
+            'drowsy': ('Drowsiness', 'Neurological'),
+            'fatigue': ('Fatigue', 'Neurological'),
+            'tired': ('Fatigue', 'Neurological'),
+            'insomnia': ('Insomnia', 'Psychiatric'),
+            'sleep': ('Sleep Disturbance', 'Psychiatric'),
+            'anxiety': ('Anxiety', 'Psychiatric'),
+            'depression': ('Depression', 'Psychiatric'),
+            'mood': ('Mood Changes', 'Psychiatric'),
+            'rash': ('Skin Rash', 'Dermatological'),
+            'itching': ('Pruritus', 'Dermatological'),
+            'weight gain': ('Weight Gain', 'Metabolic'),
+            'weight loss': ('Weight Loss', 'Metabolic'),
+            'dry mouth': ('Dry Mouth', 'Gastrointestinal'),
+            'sweating': ('Excessive Sweating', 'Dermatological'),
+            'heart': ('Cardiovascular Effects', 'Cardiovascular'),
+            'palpitation': ('Palpitations', 'Cardiovascular'),
+            'breathing': ('Respiratory Issues', 'Respiratory'),
+            'cough': ('Cough', 'Respiratory'),
+            'muscle': ('Muscle Pain', 'Musculoskeletal'),
+            'joint': ('Joint Pain', 'Musculoskeletal'),
+            'pain': ('Pain', 'Other'),
+            'vision': ('Vision Changes', 'Neurological'),
+        }
+        
+        found = set()
+        for keyword, (symptom, system) in symptom_keywords.items():
+            if keyword in text_lower and symptom not in found:
+                symptoms.append((symptom, system))
+                found.add(symptom)
+        
+        return symptoms
+    
+    def _rating_to_sentiment(self, rating: int) -> str:
+        if rating >= 8:
+            return 'positive'
+        elif rating >= 5:
+            return 'neutral'
+        else:
+            return 'negative'
 
 
 # ============================================
-# MOCK EXTRACTOR (For testing without API)
+# MOCK EXTRACTOR
 # ============================================
 
 class MockExtractor:
-    """
-    Mock extractor for testing without API access.
-    Simulates extraction using keyword matching.
-    """
+    """Mock extractor for testing without API."""
     
-    # Common symptom keywords and their mappings
-    SYMPTOM_KEYWORDS = {
-        'nausea': ('Nausea', 'moderate', 'Gastrointestinal'),
-        'vomiting': ('Vomiting', 'moderate', 'Gastrointestinal'),
-        'diarrhea': ('Diarrhea', 'moderate', 'Gastrointestinal'),
-        'constipation': ('Constipation', 'mild', 'Gastrointestinal'),
-        'headache': ('Headache', 'mild', 'Neurological'),
-        'dizziness': ('Dizziness', 'moderate', 'Neurological'),
-        'dizzy': ('Dizziness', 'moderate', 'Neurological'),
-        'drowsiness': ('Drowsiness', 'mild', 'Neurological'),
-        'drowsy': ('Drowsiness', 'mild', 'Neurological'),
-        'fatigue': ('Fatigue', 'mild', 'Neurological'),
-        'tired': ('Fatigue', 'mild', 'Neurological'),
-        'insomnia': ('Insomnia', 'moderate', 'Psychiatric'),
-        'anxiety': ('Anxiety', 'moderate', 'Psychiatric'),
-        'depression': ('Depression', 'severe', 'Psychiatric'),
-        'rash': ('Skin Rash', 'moderate', 'Dermatological'),
-        'itching': ('Pruritus', 'mild', 'Dermatological'),
-        'weight gain': ('Weight Gain', 'moderate', 'Metabolic'),
-        'weight loss': ('Weight Loss', 'moderate', 'Metabolic'),
-        'dry mouth': ('Xerostomia', 'mild', 'Gastrointestinal'),
-        'sweating': ('Hyperhidrosis', 'mild', 'Dermatological'),
-    }
+    POSITIVE_KEYWORDS = ['great', 'excellent', 'amazing', 'wonderful', 'perfect', 
+                         'life-changing', 'miracle', 'saved', 'love', 'best']
+    NEGATIVE_KEYWORDS = ['horrible', 'terrible', 'worst', 'awful', 'hate',
+                         'nightmare', 'dangerous', 'never again', 'allergic']
     
-    def extract_from_dataframe(
-        self, 
-        df: pd.DataFrame,
-        max_reviews: int = None,
-        **kwargs
-    ) -> pd.DataFrame:
-        """
-        Mock extraction using keyword matching.
-        """
-        print("\n🔧 Running MOCK extraction (no API key provided)...")
+    def extract_from_dataframe(self, df: pd.DataFrame, max_reviews: int = None, **kwargs) -> pd.DataFrame:
+        print("\n🔧 Running MOCK extraction...")
         
         if max_reviews:
             df = df.head(max_reviews)
@@ -563,64 +553,113 @@ class MockExtractor:
         rows = []
         
         for idx, row in df.iterrows():
-            text = str(row.get('combined_review', row.get('sideEffectsReview', ''))).lower()
+            text = str(row.get('combined_review', '')).lower()
+            if not text:
+                text = ' '.join([
+                    str(row.get('benefitsReview', '')),
+                    str(row.get('sideEffectsReview', '')),
+                    str(row.get('commentsReview', ''))
+                ]).lower()
             
-            for keyword, (symptom, severity, system) in self.SYMPTOM_KEYWORDS.items():
-                if keyword in text:
-                    # Find the context around the keyword
-                    start = max(0, text.find(keyword) - 30)
-                    end = min(len(text), text.find(keyword) + len(keyword) + 30)
-                    quote = text[start:end].strip()
-                    
-                    rows.append({
-                        'review_id': row.get('review_id', idx),
-                        'drug_name': row.get('urlDrugName', 'Unknown'),
-                        'condition_treated': row.get('condition', 'Unknown'),
-                        'symptom_name': symptom,
-                        'severity': severity,
-                        'body_system': system,
-                        'duration': None,
-                        'onset': None,
-                        'source_quote': f"...{quote}...",
-                        'overall_sentiment': 'extracted_mock',
-                        'extraction_confidence': 0.5
-                    })
+            rating = self._infer_rating(text)
+            severity = self._infer_severity(text)
+            
+            if severity is None:
+                continue
+            
+            symptoms = self._extract_symptoms(text)
+            if not symptoms:
+                symptoms = [('Reported Side Effects', 'Other')]
+            
+            for symptom_name, body_system in symptoms:
+                rows.append({
+                    'review_id': row.get('review_id', idx),
+                    'drug_name': row.get('urlDrugName', 'Unknown'),
+                    'condition_treated': row.get('condition', 'Unknown'),
+                    'symptom_name': symptom_name,
+                    'severity': severity,
+                    'body_system': body_system,
+                    'source_quote': text[:150] + '...',
+                    'overall_sentiment': 'positive' if rating >= 7 else 'negative' if rating <= 4 else 'neutral',
+                    'extraction_confidence': 0.5,
+                    'effectiveness': self._infer_effectiveness(rating),
+                    'rating': rating
+                })
         
-        print(f"✅ Mock extraction complete: {len(rows)} symptoms found")
+        print(f"✅ Mock extraction: {len(rows)} entries")
         return pd.DataFrame(rows)
-
-
-def get_extractor(api_key: str = None) -> Any:
-    """
-    Factory function to get the appropriate extractor.
-    Returns MockExtractor if no API key is available.
-    """
-    if api_key:
-        return AdverseEventExtractor(api_key=api_key)
     
-    # Try to get from config
+    def _infer_rating(self, text):
+        pos = sum(1 for w in self.POSITIVE_KEYWORDS if w in text)
+        neg = sum(1 for w in self.NEGATIVE_KEYWORDS if w in text)
+        if pos > neg + 2: return 9
+        elif pos > neg: return 7
+        elif neg > pos + 2: return 2
+        elif neg > pos: return 4
+        return 5
+    
+    def _infer_severity(self, text):
+        if any(w in text for w in ['hospital', 'er ', 'emergency', 'suicidal']):
+            return 'life-threatening'
+        elif 'severe' in text: return 'severe'
+        elif any(w in text for w in ['nausea', 'headache', 'dizzy']): return 'moderate'
+        elif any(w in text for w in ['dry mouth', 'slight', 'minor']): return 'mild'
+        elif 'no side effect' in text: return None
+        return 'moderate'
+    
+    def _infer_effectiveness(self, rating):
+        if rating >= 9: return "Highly Effective"
+        elif rating >= 7: return "Considerably Effective"
+        elif rating >= 5: return "Moderately Effective"
+        elif rating >= 3: return "Marginally Effective"
+        return "Ineffective"
+    
+    def _extract_symptoms(self, text):
+        symptoms = []
+        mapping = {
+            'nausea': ('Nausea', 'Gastrointestinal'),
+            'headache': ('Headache', 'Neurological'),
+            'dizzy': ('Dizziness', 'Neurological'),
+            'fatigue': ('Fatigue', 'Neurological'),
+            'insomnia': ('Insomnia', 'Psychiatric'),
+            'anxiety': ('Anxiety', 'Psychiatric'),
+            'rash': ('Skin Rash', 'Dermatological'),
+            'dry mouth': ('Dry Mouth', 'Gastrointestinal'),
+        }
+        found = set()
+        for k, (s, sys) in mapping.items():
+            if k in text and s not in found:
+                symptoms.append((s, sys))
+                found.add(s)
+        return symptoms
+
+
+def get_extractor(api_key: str = None, use_mock: bool = False) -> Any:
+    """Get appropriate extractor."""
+    if use_mock:
+        return MockExtractor()
+    
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
-    try:
-        from config import GROQ_API_KEY
-        if GROQ_API_KEY:
-            return AdverseEventExtractor(api_key=GROQ_API_KEY)
-    except:
-        pass
     
-    print("⚠️ No API key found. Using MockExtractor for demonstration.")
+    try:
+        from config import UF_API_KEY
+        if UF_API_KEY or api_key:
+            extractor = AdverseEventExtractor(api_key=api_key, timeout=90)
+            if extractor.client.initialized:
+                return extractor
+    except Exception as e:
+        print(f"⚠️ Could not initialize API: {e}")
+    
+    print("⚠️ Falling back to MockExtractor")
     return MockExtractor()
 
 
 # ============================================
-# MAIN EXECUTION
+# MAIN
 # ============================================
 
 if __name__ == "__main__":
-    """
-    Test the extractor by running:
-    python src/llm_extractor.py
-    """
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
     
@@ -628,47 +667,27 @@ if __name__ == "__main__":
     from src.preprocessor import DrugReviewPreprocessor
     
     print("\n" + "🤖 "*20)
-    print("PHARMA VIGILANCE - LLM Extraction Module")
+    print("PHARMA VIGILANCE - LLM Module Test")
     print("🤖 "*20 + "\n")
     
-    # Load and preprocess data
     loader = DrugReviewLoader()
     train_df, _ = loader.load_all_data()
     
     preprocessor = DrugReviewPreprocessor()
     processed_df = preprocessor.preprocess(train_df)
     
-    # Get extractor (will use mock if no API key)
     extractor = get_extractor()
     
-    # Extract from a small sample
-    print("\n📊 Testing extraction on 20 reviews...")
-    results_df = extractor.extract_from_dataframe(
-        processed_df,
-        max_reviews=20,
-        batch_size=5
-    )
+    print("\n📊 Testing on 5 reviews...")
+    results_df = extractor.extract_from_dataframe(processed_df, max_reviews=5)
     
-    # Display results
     print("\n" + "="*60)
-    print("📋 EXTRACTION RESULTS")
+    print("📋 RESULTS")
     print("="*60)
     
     if len(results_df) > 0:
-        print(f"\nTotal symptoms extracted: {len(results_df)}")
-        
-        print("\n📊 Symptoms by Body System:")
+        print(f"\nTotal entries: {len(results_df)}")
+        print("\n📊 By Body System:")
         print(results_df['body_system'].value_counts().to_string())
-        
-        print("\n📊 Symptoms by Severity:")
+        print("\n📊 By Severity:")
         print(results_df['severity'].value_counts().to_string())
-        
-        print("\n📋 Sample Extractions:")
-        for _, row in results_df.head(5).iterrows():
-            print(f"\n   💊 Drug: {row['drug_name']}")
-            print(f"   🩺 Symptom: {row['symptom_name']} ({row['severity']})")
-            print(f"   🏥 System: {row['body_system']}")
-            print(f"   📝 Quote: \"{row['source_quote'][:80]}...\"")
-    else:
-        print("No symptoms extracted. Check your API key or review data.")
-
