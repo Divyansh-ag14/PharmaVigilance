@@ -32,19 +32,38 @@ TRAIN_DATA_PATH = DATA_DIR / "drugLibTrain_raw.tsv"
 TEST_DATA_PATH = DATA_DIR / "drugLibTest_raw.tsv"
 
 # ============================================
-# API CONFIGURATION
+# UF API CONFIGURATION (University of Florida)
 # ============================================
-# Get API key from environment variable
-# Create a .env file with: GROQ_API_KEY=your_key_here
+# University API endpoint
+UF_API_BASE = "https://api.ai.it.ufl.edu"
+
+# API Key - Get from environment or set directly
+UF_API_KEY = os.getenv("UF_API_KEY", "sk-k1-LJhxz8tVEZogMT88alQ")
+
+# Available models at UF:
+# - llama-3.1-70b-instruct (recommended - best quality)
+# - llama-3.3-70b-instruct (newer version)
+# - llama-3.1-8b-instruct (faster, less accurate)
+# - mistral-7b-instruct
+# - mistral-small-3.1
+# - codestral-22b
+# - gemma-3-27b-it
+# - gpt-oss-20b / gpt-oss-120b
+# - granite-3.3-8b-instruct
+LLM_MODEL = "llama-3.1-70b-instruct"
+
+# Fallback models if primary fails
+FALLBACK_MODELS = [
+    "llama-3.3-70b-instruct",
+    "llama-3.1-8b-instruct",
+    "mistral-small-3.1"
+]
+
+# ============================================
+# LEGACY API KEYS (not used with UF API)
+# ============================================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-
-# Model selection for Groq
-# Options: "llama-3.1-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"
-LLM_MODEL = "llama-3.1-70b-versatile"
-
-# Optional: OpenAI for production
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = "gpt-4-turbo-preview"
 
 # ============================================
 # PROCESSING SETTINGS
@@ -57,6 +76,9 @@ MAX_REVIEWS = None
 
 # Rate limiting (requests per minute)
 RATE_LIMIT_RPM = 30
+
+# Delay between API calls (seconds)
+API_DELAY = 0.5
 
 # ============================================
 # ADVERSE EVENT CATEGORIES
@@ -91,4 +113,3 @@ ADVERSE_EVENT_CATEGORIES = [
 DASHBOARD_TITLE = "🏥 Pharma Vigilance Dashboard"
 DASHBOARD_THEME = "dark"
 PAGE_SIZE = 20  # Records per page in tables
-
