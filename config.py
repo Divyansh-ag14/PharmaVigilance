@@ -38,7 +38,7 @@ TEST_DATA_PATH = DATA_DIR / "drugLibTest_raw.tsv"
 UF_API_BASE = "https://api.ai.it.ufl.edu"
 
 # API Key - Get from environment or set directly
-UF_API_KEY = os.getenv("UF_API_KEY", "sk-k1-LJhxz8tVEZogMT88alQ")
+UF_API_KEY = os.getenv("UF_API_KEY", "-")
 
 # Available models at UF:
 # - llama-3.1-70b-instruct (recommended - best quality)
